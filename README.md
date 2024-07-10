@@ -8,20 +8,18 @@
 
 # Note
 
-**This is a template for a packer**, you can **<ins>modify it to your own use case</ins>**. at the moment can only *load in memory and run PEs*
+**This is a template for a packer**, you can modify it to your own use case
 
 # Compile
 
 ```bash
-cmake -B build
-cd build
-make # output: main
+make # output: unpacker.exe
 ```
 
 # Usage
 
 ```bash
-./main file_to_load.exe
+python packer.py file_to_load.exe # output: out.exe
 ```
 
 # Why this repository

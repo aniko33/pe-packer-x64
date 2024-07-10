@@ -12,65 +12,75 @@
 
 // https://github.com/NUL0x4C/AtomPePacker/blob/000982bb625bed6c9c1e135289c8e0f4738b8602/PP64Stub/Structs.h#L37
 
+void* load_pe(PBYTE pe_load);
+
 typedef struct _BASE_RELOCATION_ENTRY {
     WORD Offset : 12;
     WORD Type : 4;
 } BASE_RELOCATION_ENTRY, *PBASE_RELOCATION_ENTRY;
 
-
 int main(int argc, char *argv[]) {
     PVOID start_address = NULL;
+    
+    PBYTE current_va = (PBYTE) GetModuleHandle(NULL);
+    
+    IMAGE_DOS_HEADER* p_DOS_HDR  = (IMAGE_DOS_HEADER*) current_va;
+    IMAGE_NT_HEADERS* p_NT_HDR = (IMAGE_NT_HEADERS*) (((char*) p_DOS_HDR) + p_DOS_HDR->e_lfanew);
+    IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*) (p_NT_HDR + 1);
 
-    if (argc <= 1) {
-        printf("Usage :: %s <file>\n", argv[0]);
+    PBYTE section_packed = current_va + sections[p_NT_HDR->FileHeader.NumberOfSections - 1].VirtualAddress;
+
+    start_address = load_pe(section_packed);
+
+    // [ Entrypoint call ]
+
+    if (start_address != NULL) {
+        ((void (*)(void)) start_address)();
+    } else {
         return -1;
     }
 
-    // [ File reading (You can replace it) ]
+    return 0;
+}
 
-    FILE* fp = fopen(argv[1], "rb");
-
-    if (fp == NULL) {
-        return -1;
-    }
-
-    fseek(fp, 0L, SEEK_END);
-    long int fp_size = ftell(fp);
-    fseek(fp, 0L, SEEK_SET);
-
-    char* fp_data = (char*)malloc(fp_size + 1);
-    if (fp_data == NULL) {
-        return -1;
-    }
-
-    fread(fp_data, 1, fp_size, fp);
-    fclose(fp);
-
+void* load_pe(PBYTE pe_data) {
     // [ PE Parsing ]
 
-    IMAGE_DOS_HEADER* p_DOS_HDR  = (IMAGE_DOS_HEADER*) fp_data;
+    IMAGE_DOS_HEADER* p_DOS_HDR  = (IMAGE_DOS_HEADER*) pe_data;
     IMAGE_NT_HEADERS64* p_NT_HDR = (IMAGE_NT_HEADERS64*) (((PBYTE) p_DOS_HDR) + p_DOS_HDR->e_lfanew);
 
     IMAGE_DATA_DIRECTORY import_dir = p_NT_HDR->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     IMAGE_DATA_DIRECTORY reloc_dir = p_NT_HDR->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
-    PBYTE addrp = (PBYTE) VirtualAlloc(NULL, p_NT_HDR->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    // [ Allocate memory ]
+
+    PBYTE addrp = NULL;
+
+    if (p_NT_HDR->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
+        addrp = (PBYTE) VirtualAlloc(NULL, p_NT_HDR->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    } else {
+        addrp = (PBYTE) GetModuleHandle(NULL);
+    }
 
     if (addrp == NULL) {
-        return -1;
+        return NULL;
     }
 
     // [ Mapping PE sections ]
 
-    memcpy(addrp, fp_data, p_NT_HDR->OptionalHeader.SizeOfHeaders);
+    memcpy(addrp, pe_data, p_NT_HDR->OptionalHeader.SizeOfHeaders);
     IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*) (p_NT_HDR + 1);
 
     for (int i=0; i<p_NT_HDR->FileHeader.NumberOfSections; i++) {
         PBYTE dest = addrp + sections[i].VirtualAddress;
 
         if (sections[i].SizeOfRawData > 0) {
-            memcpy(dest, fp_data + sections[i].PointerToRawData, sections[i].SizeOfRawData);
+            DWORD oldProtect;
+            VirtualProtect(dest, sections[i].SizeOfRawData, PAGE_READWRITE, &oldProtect);
+            memcpy(dest, pe_data + sections[i].PointerToRawData, sections[i].SizeOfRawData);
         } else {
+            DWORD oldProtect;
+            VirtualProtect(dest, sections[i].Misc.VirtualSize, PAGE_READWRITE, &oldProtect);
             memset(dest, 0, sections[i].Misc.VirtualSize);
         }
     }
@@ -84,7 +94,7 @@ int main(int argc, char *argv[]) {
         HMODULE import_module = LoadLibraryA((LPCSTR) module_name);
 
         if (import_module == NULL) {
-            return -1;
+            return NULL;
         }
 
         IMAGE_THUNK_DATA64* lookup_table = (IMAGE_THUNK_DATA64*) (addrp + import_descriptors[i].OriginalFirstThunk);
@@ -104,7 +114,7 @@ int main(int argc, char *argv[]) {
             }
 
             if (function_handle == NULL) {
-                return -1;
+                return NULL;
             }
 
             address_table[j].u1.Function = (DWORD64) function_handle;
@@ -112,7 +122,6 @@ int main(int argc, char *argv[]) {
     }
 
     // [ Fix relocations ]
-    // https://github.com/NUL0x4C/AtomPePacker/blob/main/PP64Stub/Unpack.c#L179
 
     PIMAGE_BASE_RELOCATION p_reloc = (PIMAGE_BASE_RELOCATION) (addrp + reloc_dir.VirtualAddress);
     ULONG_PTR delta_VA_reloc = ((ULONG_PTR) addrp) - p_NT_HDR->OptionalHeader.ImageBase;
@@ -145,12 +154,19 @@ int main(int argc, char *argv[]) {
         p_reloc = (PIMAGE_BASE_RELOCATION) reloc;
     }
 
-    // [ Entrypoint call ]
+    for (int i = 0; i < p_NT_HDR->FileHeader.NumberOfSections; ++i) {
+        PBYTE dest = addrp + sections[i].VirtualAddress;
+        DWORD64 s_perm = sections[i].Characteristics;
+        DWORD64 v_perm = 0; 
+        if (s_perm & IMAGE_SCN_MEM_EXECUTE) {
+            v_perm = (s_perm & IMAGE_SCN_MEM_WRITE) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+        } else {
+            v_perm = (s_perm & IMAGE_SCN_MEM_WRITE) ? PAGE_READWRITE : PAGE_READONLY;
+        }
+        DWORD oldProtect;
+        VirtualProtect(dest, sections[i].Misc.VirtualSize, v_perm, &oldProtect);
+    }
 
-    start_address = (PVOID) (addrp + p_NT_HDR->OptionalHeader.AddressOfEntryPoint);
-
-    ((void (*)(void)) start_address)();
-
-    return 0;
+    return (PVOID) (addrp + p_NT_HDR->OptionalHeader.AddressOfEntryPoint);
 }
 
